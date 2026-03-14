@@ -8,6 +8,7 @@
 #   comet-snap list-backups         List auto-backups created before each restore
 #   comet-snap delete <name>        Delete a named snapshot
 #   comet-snap delete-backup <name> Delete an auto-backup
+#   comet-snap info                 Print resolved paths/profile target
 #
 # Comet must be fully closed before save or restore.
 
@@ -17,8 +18,9 @@ set -euo pipefail
 # Config
 # ---------------------------------------------------------------------------
 
-COMET_ROOT="$HOME/Library/Application Support/Comet"
-COMET_PROFILE="$COMET_ROOT/Default"
+DEFAULT_COMET_ROOT="$HOME/Library/Application Support/Comet"
+COMET_ROOT="${COMET_USER_DATA_DIR:-$DEFAULT_COMET_ROOT}"
+COMET_PROFILE=""
 SNAPSHOTS_DIR="$COMET_ROOT/custom-snapshots"
 MAX_AUTO_BACKUPS=5
 
@@ -53,6 +55,93 @@ warn() { echo "⚠️   $*"; }
 
 preflight() {
   command -v python3 >/dev/null 2>&1 || err "python3 is required but not found. Install Xcode Command Line Tools: xcode-select --install"
+}
+
+validate_profile_name_component() {
+  local name="$1" source="$2"
+  [[ -n "$name" ]] || err "$source cannot be empty."
+  [[ "$name" != "." && "$name" != ".." ]] || err "Invalid $source '$name'."
+  if [[ "$name" == *"/"* || "$name" == *"\\"* ]]; then
+    err "Invalid $source '$name'. Must be a profile directory name, not a path."
+  fi
+}
+
+resolve_profile_candidates_from_local_state() {
+  local local_state="$COMET_ROOT/Local State"
+  [[ -f "$local_state" ]] || return 0
+
+  python3 - "$local_state" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    raise SystemExit(0)
+
+profile = data.get("profile", {})
+seen = set()
+
+def emit(value):
+    if not isinstance(value, str):
+        return
+    value = value.strip()
+    if (
+        not value
+        or value in (".", "..")
+        or "/" in value
+        or "\\" in value
+        or value in seen
+    ):
+        return
+    seen.add(value)
+    print(value)
+
+last_active_profiles = profile.get("last_active_profiles")
+if isinstance(last_active_profiles, list):
+    for candidate in last_active_profiles:
+        emit(candidate)
+
+emit(profile.get("last_used"))
+emit(profile.get("last_active_profile"))
+
+info_cache = profile.get("info_cache")
+if isinstance(info_cache, dict):
+    for key in info_cache.keys():
+        emit(key)
+PY
+}
+
+resolve_runtime_paths() {
+  COMET_ROOT="${COMET_USER_DATA_DIR:-$DEFAULT_COMET_ROOT}"
+  SNAPSHOTS_DIR="$COMET_ROOT/custom-snapshots"
+
+  if [[ -n "${COMET_PROFILE_DIR:-}" ]]; then
+    [[ "$COMET_PROFILE_DIR" = /* ]] || err "COMET_PROFILE_DIR must be an absolute path."
+    COMET_PROFILE="$COMET_PROFILE_DIR"
+    return
+  fi
+
+  local profile_name=""
+  if [[ -n "${COMET_PROFILE_NAME:-}" ]]; then
+    validate_profile_name_component "$COMET_PROFILE_NAME" "COMET_PROFILE_NAME"
+    profile_name="$COMET_PROFILE_NAME"
+  else
+    local candidate
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      if [[ -d "$COMET_ROOT/$candidate" ]]; then
+        profile_name="$candidate"
+        break
+      fi
+    done < <(resolve_profile_candidates_from_local_state)
+
+    [[ -n "$profile_name" ]] || profile_name="Default"
+  fi
+
+  COMET_PROFILE="$COMET_ROOT/$profile_name"
 }
 
 validate_name() {
@@ -179,6 +268,8 @@ cmd_save() {
   [[ $# -le 1 ]] || err "Too many arguments. Usage: comet-snap save <name>"
   check_comet_closed
 
+  mkdir -p "$SNAPSHOTS_DIR"
+
   local dest="$SNAPSHOTS_DIR/$name"
   local tmp_dir
   tmp_dir=$(mktemp -d "$SNAPSHOTS_DIR/.save-tmp-XXXXXX")
@@ -206,6 +297,8 @@ cmd_restore() {
   local name="${1:-}"
   [[ -n "$name" ]] || { usage; exit 1; }
   [[ $# -le 1 ]] || err "Too many arguments. Usage: comet-snap restore <name>"
+
+  mkdir -p "$SNAPSHOTS_DIR"
 
   # Allow both named snapshots and auto-backups to be restored
   local snap_dir
@@ -270,6 +363,18 @@ cmd_restore() {
   if [[ "$name" != .pre-restore-* ]]; then
     info "Previous session backed up as '$backup_name' (use 'comet-snap restore $backup_name' to undo)."
   fi
+}
+
+cmd_info() {
+  [[ $# -eq 0 ]] || err "Too many arguments. Usage: comet-snap info"
+  local exists="no"
+  [[ -d "$COMET_PROFILE" ]] && exists="yes"
+  cat <<EOF
+COMET_ROOT=$COMET_ROOT
+COMET_PROFILE=$COMET_PROFILE
+SNAPSHOTS_DIR=$SNAPSHOTS_DIR
+PROFILE_EXISTS=$exists
+EOF
 }
 
 cmd_list() {
@@ -360,6 +465,7 @@ Usage:
   comet-snap list-backups          List auto-backups created before each restore
   comet-snap delete <name>         Delete a named snapshot
   comet-snap delete-backup <name>  Delete an auto-backup
+  comet-snap info                  Print resolved paths/profile target
 
 Notes:
   - Comet must be fully closed before save or restore
@@ -367,6 +473,14 @@ Notes:
   - Cookies are Keychain-encrypted — snapshots only work on this machine/user
   - Names: letters, numbers, hyphens, underscores, dots only
   - Auto-backups are kept automatically (last $MAX_AUTO_BACKUPS retained)
+
+Env overrides (precedence):
+  1) COMET_PROFILE_DIR  (absolute path, highest precedence)
+  2) COMET_PROFILE_NAME (profile dir name under COMET_ROOT)
+  3) Local State profile metadata (last_active_profiles[0], etc.)
+  4) Default profile fallback
+
+  COMET_USER_DATA_DIR overrides COMET_ROOT (default: $DEFAULT_COMET_ROOT)
 
 EOF
 }
@@ -376,6 +490,7 @@ EOF
 # ---------------------------------------------------------------------------
 
 preflight
+resolve_runtime_paths
 
 CMD="${1:-}"
 shift || true
@@ -387,5 +502,6 @@ case "$CMD" in
   list-backups)   cmd_list_backups ;;
   delete)         cmd_delete "$@" ;;
   delete-backup)  cmd_delete_backup "$@" ;;
+  info)           cmd_info "$@" ;;
   *)              usage; exit 1 ;;
 esac

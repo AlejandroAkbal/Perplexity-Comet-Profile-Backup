@@ -1,84 +1,126 @@
 # Comet Custom Snapshots
 
-This directory contains snapshots of the Comet browser's session data — specifically cookies, local storage, and other auth-related files. The goal is to preserve a "logged-in" state so it can be restored at any time, without keeping sensitive data in the live profile permanently.
+This repo contains `comet-snap.sh`, a script for saving/restoring Comet auth/session state (cookies, storage, profile prefs) as reusable snapshots.
 
-## Why this exists
+## Current machine/runtime alignment
 
-Comet doesn't support private/incognito profiles in a way that's controllable via MCP. Instead of using the live profile (which accumulates data), we snapshot just the essential session files, wipe the profile when needed, and restore from a snapshot when we want a known state back.
+- Current MCP + LaunchAgent Comet runtime uses user data dir:  
+  `/Users/lume/Library/Application Support/Comet`
+- Current active profile is `Default` (from `Local State` metadata).
+- MCP patching targets `${userDataDir}/Default/Preferences` and supports `COMET_USER_DATA_DIR`.
 
-## What gets snapshotted
+The script is now aligned with that model:
 
-Only auth and session-relevant files — not cache, history, extensions, or anything else:
+- `COMET_USER_DATA_DIR` controls Comet root (default macOS path above).
+- Active profile can be resolved dynamically from `Local State` (with explicit overrides available).
+- Snapshots are always stored under `${COMET_ROOT}/custom-snapshots`.
 
-| File / Directory | Contains |
-|---|---|
-| `Cookies`, `Cookies-journal` | HTTP cookies (all sites) |
-| `Login Data`, `Login Data For Account` | Saved passwords |
-| `Local Storage/` | localStorage per origin |
-| `IndexedDB/` | IndexedDB per origin |
-| `SharedStorage`, `WebStorage/` | Shared/web storage APIs |
-| `Web Data`, `Account Web Data` | Autofill, form data |
-| `Preferences`, `Secure Preferences` | Profile settings |
-| `Sessions/` | Tab/session restore data |
+## Profile/path resolution
 
-**Note:** On macOS, cookies and passwords are encrypted using a key stored in the system Keychain under Comet's bundle ID. Snapshots are only portable on the **same machine and user account**. If your macOS Keychain is reset (e.g. after an OS reinstall), restored cookies will be silently dropped — Comet will just show you as logged out.
+`comet-snap.sh` resolves target paths in this precedence:
 
-## Usage
+1. `COMET_PROFILE_DIR` (absolute path override)
+2. `COMET_PROFILE_NAME` (profile directory name under `COMET_ROOT`)
+3. `Local State` inference (tries `profile.last_active_profiles`, then other profile metadata)
+4. Fallback: `Default`
+
+`COMET_ROOT` is resolved from:
+
+- `COMET_USER_DATA_DIR` if set
+- else default: `~/Library/Application Support/Comet`
+
+Use the built-in `info` command to verify what will be touched:
 
 ```bash
+bash comet-snap.sh info
+```
+
+It prints:
+
+- `COMET_ROOT`
+- `COMET_PROFILE`
+- `SNAPSHOTS_DIR`
+- `PROFILE_EXISTS` (`yes`/`no`)
+
+## Usage (repo-based script)
+
+Run commands from this repo:
+
+```bash
+cd /Users/lume/Projects/Perplexity-Comet-Profile-Backup
+
+# Inspect resolved profile/paths
+bash comet-snap.sh info
+
 # Save current session
 bash comet-snap.sh save <name>
 
 # Restore a snapshot (auto-backs up current state first)
 bash comet-snap.sh restore <name>
 
-# List all snapshots
+# List named snapshots
 bash comet-snap.sh list
 
-# List auto-backups created before each restore
+# List auto-backups created before restore
 bash comet-snap.sh list-backups
 
-# Delete a snapshot
+# Delete named snapshot
 bash comet-snap.sh delete <name>
+
+# Delete auto-backup
+bash comet-snap.sh delete-backup <name>
 ```
 
-**Comet must be fully closed** before saving or restoring — otherwise SQLite and LevelDB files will be locked. The script checks for all Comet processes (including GPU and renderer helpers) and will refuse to run if any are still alive.
+Examples with overrides:
 
-## Snapshot storage
+```bash
+# Use alternate Comet user data dir
+COMET_USER_DATA_DIR="/path/to/Comet" bash comet-snap.sh info
 
-Each snapshot is stored as a subdirectory here:
+# Force profile by name under COMET_ROOT
+COMET_PROFILE_NAME="Profile 2" bash comet-snap.sh save alt-profile
+
+# Force profile by absolute path
+COMET_PROFILE_DIR="/path/to/Comet/Default" bash comet-snap.sh list
+```
+
+**Comet must be fully closed** before save/restore. The script checks running Comet processes and refuses to proceed if Comet is still running.
+
+## Snapshot contents
+
+Only auth/session-relevant files are included (not cache/history/extensions):
+
+| File / Directory | Contains |
+|---|---|
+| `Cookies`, `Cookies-journal` | HTTP cookies |
+| `Login Data`, `Login Data For Account` | Saved passwords |
+| `Local Storage/` | localStorage per origin |
+| `IndexedDB/` | IndexedDB per origin |
+| `SharedStorage`, `WebStorage/` | Shared/web storage APIs |
+| `Web Data`, `Account Web Data` | Autofill/form data |
+| `Preferences`, `Secure Preferences` | Profile settings |
+| `Sessions/` | Tab/session restore data |
+
+macOS note: cookies/passwords are Keychain-encrypted; snapshots are portable only on the same machine + user account.
+
+## Storage location
+
+Snapshots are written to:
 
 ```text
-custom-snapshots/
+${COMET_ROOT}/custom-snapshots/
   <name>/
-    Cookies
-    Local Storage/
     ...
-    .meta.json          ← name, timestamp, and item count (integrity check)
-  .pre-restore-<ts>/    ← auto-backups created before each restore (hidden)
+    .meta.json
+  .pre-restore-<ts>/
 ```
 
-Snapshot names may only contain letters, numbers, hyphens, underscores, and dots.
+Snapshot names: letters, numbers, hyphens, underscores, dots.
 
 ## Safety features
 
-- **Auto-backup before restore**: every `restore` command automatically snapshots your current session as `.pre-restore-<timestamp>` before touching anything. Use `comet-snap.sh list-backups` to see them and `restore .pre-restore-<name>` to undo a restore.
-- **Atomic restore**: files are staged to a temp directory first, then moved into the profile atomically. A failed restore never leaves the profile in a broken half-state.
-- **Integrity check**: each snapshot records how many files were copied. An interrupted save is detected and rejected at restore time.
-- **Process check**: uses `pgrep -f "Comet.app/Contents"` to detect all Comet subprocesses, not just the main window.
-- **Stale lock cleanup**: removes leftover `SingletonLock`/`SingletonSocket`/`SingletonCookie` files from crash sessions before proceeding.
-
-## Typical workflow
-
-1. Log in to all your sites in Comet normally
-2. Close Comet fully
-3. `bash comet-snap.sh save logged-in`
-4. Use Comet — browse freely, accumulate junk data
-5. When you want a clean slate: close Comet, wipe only the `Default/` profile dir, restore:
-   ```bash
-   rm -rf ~/Library/Application\ Support/Comet/Default
-   bash ~/Library/Application\ Support/Comet/custom-snapshots/comet-snap.sh restore logged-in
-   ```
-6. Reopen Comet — fully logged in, clean profile
-
-> ⚠️ Only delete `Default/` — never delete the entire `Comet/` directory, as that would also remove this script and all your snapshots.
+- Auto-backup before restore (`.pre-restore-<timestamp>`)
+- Atomic save/restore staging
+- Metadata-based integrity checks
+- Process guard via `pgrep -f "Comet.app/Contents"`
+- Stale lock cleanup (`SingletonLock` / `SingletonSocket` / `SingletonCookie`)
